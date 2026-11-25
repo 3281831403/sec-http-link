@@ -10,10 +10,62 @@ from __future__ import annotations
 
 from typing import Any, Dict, List, Mapping, Optional, Sequence
 
+# Characters permitted in an HTTP token (RFC 7230 section 3.2.6).  A parameter
+# value may be emitted unquoted only when every character is in this set.
+_TOKEN_CHARS = frozenset(
+    "!#$%&'*+-.^_`|~"
+    "0123456789"
+    "abcdefghijklmnopqrstuvwxyz"
+    "ABCDEFGHIJKLMNOPQRSTUVWXYZ"
+)
 
-def _split(text: str, separator: str) -> List[str]:
-    """Split on a separator."""
-    return text.split(separator)
+
+def _is_token(value: str) -> bool:
+    """Return True when *value* can be emitted without surrounding quotes."""
+    return bool(value) and all(ch in _TOKEN_CHARS for ch in value)
+
+
+def _split(text: str, separator: str, angle: bool = False) -> List[str]:
+    """Split *text* on *separator*, ignoring separators inside quoting.
+
+    When *angle* is true, separators inside a ``<...>`` span are ignored as
+    well.  Quoted strings (with backslash escapes) are always skipped.
+    """
+    parts: List[str] = []
+    buf: List[str] = []
+    in_quotes = False
+    escaped = False
+    in_angle = False
+    for ch in text:
+        if in_quotes:
+            buf.append(ch)
+            if escaped:
+                escaped = False
+            elif ch == "\\":
+                escaped = True
+            elif ch == '"':
+                in_quotes = False
+            continue
+        if angle and in_angle:
+            buf.append(ch)
+            if ch == ">":
+                in_angle = False
+            continue
+        if ch == '"':
+            in_quotes = True
+            buf.append(ch)
+            continue
+        if angle and ch == "<":
+            in_angle = True
+            buf.append(ch)
+            continue
+        if ch == separator:
+            parts.append("".join(buf))
+            buf = []
+            continue
+        buf.append(ch)
+    parts.append("".join(buf))
+    return parts
 
 
 def _unquote(raw: str) -> str:
@@ -32,20 +84,29 @@ def _unquote(raw: str) -> str:
     return raw
 
 
-def _quote(value: str) -> str:
-    if " " in value:
-        return '"' + value + '"'
-    return value
-
-
 def _quote_forced(value: str) -> str:
     return '"' + value.replace("\\", "\\\\").replace('"', '\\"') + '"'
+
+
+def _quote(value: str) -> str:
+    """Quote *value* only when it is not a valid token."""
+    if _is_token(value):
+        return value
+    return _quote_forced(value)
+
+
+def _rel_values(link: Mapping[str, Any]) -> List[Any]:
+    """Return the relation tokens of *link*, matching the key case-insensitively."""
+    for name, values in link["params"].items():
+        if name.lower() == "rel":
+            return list(values)
+    return []
 
 
 def parse(value: str) -> List[Dict[str, Any]]:
     """Parse a Link header value into a list of link items."""
     links: List[Dict[str, Any]] = []
-    for chunk in _split(value, ","):
+    for chunk in _split(value, ",", angle=True):
         chunk = chunk.strip()
         if not chunk:
             continue
@@ -56,19 +117,25 @@ def parse(value: str) -> List[Dict[str, Any]]:
             raise ValueError("invalid-link")
         uri = chunk[1:end]
         params: Dict[str, List[str]] = {}
-        for part in chunk[end + 1 :].split(";"):
+        for part in _split(chunk[end + 1 :], ";"):
             part = part.strip()
             if not part:
                 continue
             if "=" in part:
                 name, raw = part.split("=", 1)
-                name = name.strip()
+                name = name.strip().lower()
                 item = _unquote(raw.strip())
             else:
-                name = part
+                name = part.lower()
                 item = ""
-            values = [item]
-            params[name] = values
+            if name == "rel":
+                values = item.split()
+            else:
+                values = [item]
+            if name in params:
+                params[name].extend(values)
+            else:
+                params[name] = list(values)
         links.append({"uri": uri, "params": params})
     return links
 
@@ -79,9 +146,7 @@ def serialize(links: Sequence[Mapping[str, Any]]) -> str:
     for link in links:
         parts = ["<" + str(link["uri"]) + ">"]
         for name, values in link["params"].items():
-            if not values:
-                continue
-            if name == "rel":
+            if name.lower() == "rel":
                 parts.append(
                     "; rel=" + _quote_forced(" ".join(str(v) for v in values))
                 )
@@ -93,50 +158,82 @@ def serialize(links: Sequence[Mapping[str, Any]]) -> str:
 
 
 def find(links: Sequence[Mapping[str, Any]], rel: str) -> List[Dict[str, Any]]:
-    """Return links whose relation list contains the requested type."""
-    target = rel.strip()
+    """Return every link whose relation list contains the requested type."""
+    target = rel.strip().lower()
     if not target:
         return []
+    matches: List[Dict[str, Any]] = []
     for link in links:
-        values = link["params"].get("rel", [])
-        if target in values:
-            return [{"uri": link["uri"], "params": dict(link["params"])}]
-    return []
+        values = _rel_values(link)
+        if any(str(value).lower() == target for value in values):
+            matches.append(
+                {
+                    "uri": link["uri"],
+                    "params": {
+                        name: list(values) for name, values in link["params"].items()
+                    },
+                }
+            )
+    return matches
 
 
 def merge_links(
     first: Sequence[Mapping[str, Any]], second: Sequence[Mapping[str, Any]]
 ) -> List[Dict[str, Any]]:
-    """Merge two link lists into one."""
+    """Merge two link lists, de-duplicating by target URI."""
     merged: List[Dict[str, Any]] = []
+    seen: Dict[str, Dict[str, Any]] = {}
     for link in list(first) + list(second):
-        merged.append(
-            {
-                "uri": str(link["uri"]),
-                "params": {name: list(values) for name, values in link["params"].items()},
+        uri = str(link["uri"])
+        params = link["params"]
+        entry = seen.get(uri)
+        if entry is None:
+            entry = {
+                "uri": uri,
+                "params": {name: list(values) for name, values in params.items()},
             }
-        )
+            seen[uri] = entry
+            merged.append(entry)
+            continue
+        existing = {name.lower(): name for name in entry["params"]}
+        for name, values in params.items():
+            key = name.lower()
+            if key == "rel":
+                if key in existing:
+                    target = entry["params"][existing[key]]
+                    for value in values:
+                        if not any(value == current for current in target):
+                            target.append(value)
+                else:
+                    entry["params"][name] = list(values)
+                    existing[key] = name
+            elif key not in existing:
+                entry["params"][name] = list(values)
+                existing[key] = name
+            # A non-relation conflict keeps the value that appeared first.
     return merged
 
 
 def to_preload_headers(links: Sequence[Mapping[str, Any]]) -> List[str]:
-    """Render preload candidates."""
+    """Render preload candidates: items declaring both ``preload`` and ``as``."""
     headers: List[str] = []
     for link in links:
-        relations = [str(value).lower() for value in link["params"].get("rel", [])]
+        relations = [str(value).lower() for value in _rel_values(link)]
         if "preload" not in relations:
             continue
-        values = link["params"].get("as") or [""]
+        params = link["params"]
+        as_key: Optional[str] = next(
+            (name for name in params if name.lower() == "as"), None
+        )
+        if as_key is None:
+            continue
+        values = params[as_key]
+        if not values:
+            continue
         headers.append(
             "<"
-            + _absolute(str(link["uri"]))
+            + str(link["uri"])
             + ">; rel=preload; as="
             + _quote(str(values[0]))
         )
     return headers
-
-
-def _absolute(uri: str) -> str:
-    if "://" in uri or uri.startswith("//"):
-        return uri
-    return "/" + uri.lstrip("/")
